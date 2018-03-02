@@ -34,7 +34,7 @@ parser.add_argument('--epochs', default=70, type=int, help='Number of training e
 parser.add_argument('--cuda', dest='cuda', action='store_true', help='Use cuda to train model')
 parser.add_argument('--lr', '--learning-rate', default=3e-4, type=float, help='initial learning rate')
 parser.add_argument('--early-stopping', action='store_true', help='perform early stopping instead of fixed number of epochs')
-parser.add_argument('--stop-after', default=5, type=int,  help='Stops when loss does not increase for n consecutive epochs')
+parser.add_argument('--stop-after', default=2, type=int,  help='Stops when loss does not decrease for n consecutive batches')
 parser.add_argument('--momentum', default=0.9, type=float, help='momentum')
 parser.add_argument('--max-norm', default=400, type=int, help='Norm cutoff to prevent explosion of gradients')
 parser.add_argument('--learning-anneal', default=1.1, type=float, help='Annealing applied to learning rate every epoch')
@@ -103,17 +103,36 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-def should_terminate(epoch, no_epochs, early_stopping, stop_after, loss_history):
+class EarlyStoppingHandler:
+    
+    def __init__(self, history=None, stop_after=5):
+        self.set_history(history)
+        self._stop_after = stop_after
+
+    def update_history(self, value):
+        self._early_stopping_history.append(value)
+
+    def set_history(self, history):
+        self._early_stopping_history = [] if history is None else history
+
+    def get_history(self):
+        return self._early_stopping_history
+
+    def should_stop(self):
+        if len(self._early_stopping_history) <= self._stop_after:
+            return False
+
+        # loss did not drop for 'stop_after' consecutive steps
+        return all([self._early_stopping_history[i-1] < self._early_stopping_history[i] for i in range(-self._stop_after, 0)])
+
+
+
+def should_terminate(epoch, num_epochs, perform_early_stopping, early_stopping_handler):
     """Determines if the terminating condition has been met."""
+    if not perform_early_stopping:
+        return epoch >= num_epochs
 
-    if not early_stopping:
-        return epoch >= no_epochs
-
-    if len(loss_history) <= stop_after:
-        return False
-
-    # loss did not drop for 'stop_after' consecutive epochs
-    return all([loss_history[i-1] < loss_history[i] for i in range(-stop_after, 0)])
+    return early_stopping_handler.should_stop()
 
 
 if __name__ == '__main__':
@@ -167,7 +186,7 @@ if __name__ == '__main__':
     criterion = CTCLoss()
 
     avg_loss, start_epoch, start_iter = 0, 0, 0
-    loss_history = []
+    early_stopping_handler = EarlyStoppingHandler(stop_after=args.stop_after)
     if args.continue_from:  # Starting from previous model
         print("Loading checkpoint model %s" % args.continue_from)
         package = torch.load(args.continue_from, map_location=lambda storage, loc: storage)
@@ -177,6 +196,7 @@ if __name__ == '__main__':
         parameters = model.parameters()
         optimizer = torch.optim.SGD(parameters, lr=args.lr,
                                     momentum=args.momentum, nesterov=True)
+        early_stopping_handler.set_history(package.get('early_stopping_history', None))
         if not args.finetune:  # Don't want to restart training
             optimizer.load_state_dict(package['optim_dict'])
 
@@ -196,7 +216,6 @@ if __name__ == '__main__':
             else:
                 start_iter += 1
             avg_loss = int(package.get('avg_loss', 0))
-            loss_history = package.get('loss_history', [])
             loss_results, cer_results, wer_results = package['loss_results'], package[
                 'cer_results'], package['wer_results']
             if main_proc and args.visdom and \
@@ -278,7 +297,7 @@ if __name__ == '__main__':
     losses = AverageMeter()
     epoch = start_epoch
 
-    while not should_terminate(epoch, args.epochs, args.early_stopping, args.stop_after, loss_history):
+    while not should_terminate(epoch, args.epochs, args.early_stopping, early_stopping_handler):
         model.train()
         end = time.time()
         start_epoch_time = time.time()
@@ -341,14 +360,13 @@ if __name__ == '__main__':
                 print("Saving checkpoint model to %s" % file_path)
                 torch.save(DeepSpeech.serialize(model, optimizer=optimizer, epoch=epoch, iteration=i,
                                                 loss_results=loss_results,
-                                                wer_results=wer_results, cer_results=cer_results, avg_loss=avg_loss, loss_history=loss_history),
+                                                wer_results=wer_results, cer_results=cer_results, avg_loss=avg_loss, early_stopping_history=early_stopping_handler.get_history()),
                            file_path)
             del loss
             del out
         avg_loss /= len(train_sampler)
-        loss_history.append(avg_loss)
         epoch_time = time.time() - start_epoch_time
-        print('Loss history: ', str(loss_history[-args.stop_after:]))
+        print('Valid loss history: {}'.format(early_stopping_handler.get_history()))
         print('Training Summary Epoch: [{0}]\t'
               'Time taken (s): {epoch_time:.0f}\t'
               'Average Loss {loss:.3f}\t'.format(
@@ -357,10 +375,11 @@ if __name__ == '__main__':
         start_iter = 0  # Reset start iteration for next epoch
         total_cer, total_wer = 0, 0
         model.eval()
+        total_valid_loss = 0
         for i, (data) in tqdm(enumerate(test_loader), total=len(test_loader)):
             inputs, targets, input_percentages, target_sizes = data
 
-            inputs = Variable(inputs, volatile=True)
+            inputs = Variable(inputs, volatile=True, requires_grad=False)
 
             # unflatten targets
             split_targets = []
@@ -374,7 +393,19 @@ if __name__ == '__main__':
 
             out = model(inputs)  # NxTxH
             seq_length = out.size(1)
+
             sizes = input_percentages.mul_(int(seq_length)).int()
+            var_sizes = Variable(input_percentages.mul_(int(seq_length)).int(), requires_grad=False)
+            var_target_sizes = Variable(target_sizes, requires_grad=False)
+            var_targets = Variable(targets, requires_grad=False)
+
+            #loss = criterion(out, var_targets, var_sizes, var_target_sizes)
+            #total_valid_loss += loss / inputs.size(0)  # average the loss by minibatch
+            # del loss
+            del var_target_sizes
+            del var_targets
+            del var_sizes
+            torch.cuda.empty_cache()
 
             decoded_output, _ = decoder.decode(out.data, sizes)
             target_strings = decoder.convert_to_strings(split_targets)
@@ -391,8 +422,11 @@ if __name__ == '__main__':
             del out
         wer = total_wer / len(test_loader.dataset)
         cer = total_cer / len(test_loader.dataset)
+        valid_loss = total_valid_loss / len(test_loader.dataset)
         wer *= 100
         cer *= 100
+        # early stopping depends on which measure we add here
+        early_stopping_handler.update_history(cer)
         loss_results[epoch] = avg_loss
         wer_results[epoch] = wer
         cer_results[epoch] = cer
@@ -432,7 +466,7 @@ if __name__ == '__main__':
         if args.checkpoint and main_proc:
             file_path = '%s/deepspeech_%d.pth.tar' % (save_folder, epoch + 1)
             torch.save(DeepSpeech.serialize(model, optimizer=optimizer, epoch=epoch, loss_results=loss_results,
-                                            wer_results=wer_results, cer_results=cer_results, loss_history=loss_history),
+                                            wer_results=wer_results, cer_results=cer_results, early_stopping_history=early_stopping_handler.get_history()),
                        file_path)
         # anneal lr
         optim_state = optimizer.state_dict()
@@ -443,7 +477,7 @@ if __name__ == '__main__':
         if (best_wer is None or best_wer > wer) and main_proc:
             print("Found better validated model, saving to %s" % args.model_path)
             torch.save(DeepSpeech.serialize(model, optimizer=optimizer, epoch=epoch, loss_results=loss_results,
-                                            wer_results=wer_results, cer_results=cer_results, loss_history=loss_history)
+                                            wer_results=wer_results, cer_results=cer_results, early_stopping_history=early_stopping_handler.get_history())
                        , args.model_path)
             best_wer = wer
 
