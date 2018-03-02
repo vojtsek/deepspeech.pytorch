@@ -219,7 +219,7 @@ class DeepSpeech(nn.Module):
 
     @staticmethod
     def serialize(model, optimizer=None, epoch=None, iteration=None, loss_results=None,
-                  cer_results=None, wer_results=None, avg_loss=None, meta=None):
+                  cer_results=None, wer_results=None, avg_loss=None, meta=None, loss_history=None):
         model_is_cuda = next(model.parameters()).is_cuda
         model = model.module if model_is_cuda else model
         package = {
@@ -246,6 +246,8 @@ class DeepSpeech(nn.Module):
             package['wer_results'] = wer_results
         if meta is not None:
             package['meta'] = meta
+        if loss_history is not None:
+            package['loss_history'] = loss_history
         return package
 
     @staticmethod

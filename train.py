@@ -33,6 +33,8 @@ parser.add_argument('--rnn-type', default='gru', help='Type of the RNN. rnn|gru|
 parser.add_argument('--epochs', default=70, type=int, help='Number of training epochs')
 parser.add_argument('--cuda', dest='cuda', action='store_true', help='Use cuda to train model')
 parser.add_argument('--lr', '--learning-rate', default=3e-4, type=float, help='initial learning rate')
+parser.add_argument('--early-stopping', action='store_true', help='perform early stopping instead of fixed number of epochs')
+parser.add_argument('--stop-after', default=5, type=int,  help='Stops when loss does not increase for n consecutive epochs')
 parser.add_argument('--momentum', default=0.9, type=float, help='momentum')
 parser.add_argument('--max-norm', default=400, type=int, help='Norm cutoff to prevent explosion of gradients')
 parser.add_argument('--learning-anneal', default=1.1, type=float, help='Annealing applied to learning rate every epoch')
@@ -101,6 +103,19 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
+def should_terminate(epoch, no_epochs, early_stopping, stop_after, loss_history):
+    """Determines if the terminating condition has been met."""
+
+    if not early_stopping:
+        return epoch >= no_epochs
+
+    if len(loss_history) <= stop_after:
+        return False
+
+    # loss did not drop for 'stop_after' consecutive epochs
+    return all([loss_history[i-1] < loss_history[i] for i in range(-stop_after, 0)])
+
+
 if __name__ == '__main__':
     args = parser.parse_args()
     args.distributed = args.world_size > 1
@@ -152,6 +167,7 @@ if __name__ == '__main__':
     criterion = CTCLoss()
 
     avg_loss, start_epoch, start_iter = 0, 0, 0
+    loss_history = []
     if args.continue_from:  # Starting from previous model
         print("Loading checkpoint model %s" % args.continue_from)
         package = torch.load(args.continue_from, map_location=lambda storage, loc: storage)
@@ -180,6 +196,7 @@ if __name__ == '__main__':
             else:
                 start_iter += 1
             avg_loss = int(package.get('avg_loss', 0))
+            loss_history = package.get('loss_history', [])
             loss_results, cer_results, wer_results = package['loss_results'], package[
                 'cer_results'], package['wer_results']
             if main_proc and args.visdom and \
@@ -259,8 +276,9 @@ if __name__ == '__main__':
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
+    epoch = start_epoch
 
-    for epoch in range(start_epoch, args.epochs):
+    while not should_terminate(epoch, args.epochs, args.early_stopping, args.stop_after, loss_history):
         model.train()
         end = time.time()
         start_epoch_time = time.time()
@@ -323,13 +341,14 @@ if __name__ == '__main__':
                 print("Saving checkpoint model to %s" % file_path)
                 torch.save(DeepSpeech.serialize(model, optimizer=optimizer, epoch=epoch, iteration=i,
                                                 loss_results=loss_results,
-                                                wer_results=wer_results, cer_results=cer_results, avg_loss=avg_loss),
+                                                wer_results=wer_results, cer_results=cer_results, avg_loss=avg_loss, loss_history=loss_history),
                            file_path)
             del loss
             del out
         avg_loss /= len(train_sampler)
-
+        loss_history.append(avg_loss)
         epoch_time = time.time() - start_epoch_time
+        print('Loss history: ', str(loss_history[-args.stop_after:]))
         print('Training Summary Epoch: [{0}]\t'
               'Time taken (s): {epoch_time:.0f}\t'
               'Average Loss {loss:.3f}\t'.format(
@@ -413,7 +432,7 @@ if __name__ == '__main__':
         if args.checkpoint and main_proc:
             file_path = '%s/deepspeech_%d.pth.tar' % (save_folder, epoch + 1)
             torch.save(DeepSpeech.serialize(model, optimizer=optimizer, epoch=epoch, loss_results=loss_results,
-                                            wer_results=wer_results, cer_results=cer_results),
+                                            wer_results=wer_results, cer_results=cer_results, loss_history=loss_history),
                        file_path)
         # anneal lr
         optim_state = optimizer.state_dict()
@@ -424,7 +443,7 @@ if __name__ == '__main__':
         if (best_wer is None or best_wer > wer) and main_proc:
             print("Found better validated model, saving to %s" % args.model_path)
             torch.save(DeepSpeech.serialize(model, optimizer=optimizer, epoch=epoch, loss_results=loss_results,
-                                            wer_results=wer_results, cer_results=cer_results)
+                                            wer_results=wer_results, cer_results=cer_results, loss_history=loss_history)
                        , args.model_path)
             best_wer = wer
 
@@ -432,3 +451,4 @@ if __name__ == '__main__':
         if not args.no_shuffle:
             print("Shuffling batches...")
             train_sampler.shuffle(epoch)
+        epoch += 1
